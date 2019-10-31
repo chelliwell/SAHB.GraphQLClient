@@ -5,9 +5,11 @@ using System.Linq;
 using System.Text;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
+using SAHB.GraphQLClient.Internal;
 using SAHB.GraphQLClient.Exceptions;
 using SAHB.GraphQLClient.FieldBuilder;
-using SAHB.GraphQLClient.Internal;
+using System.Reflection;
+using System.Runtime.Serialization;
 
 namespace SAHB.GraphQLClient.QueryGenerator
 {
@@ -39,69 +41,8 @@ namespace SAHB.GraphQLClient.QueryGenerator
 
         private string GetQuery(GraphQLOperationType operationType, ICollection<GraphQLField> fields, params GraphQLQueryArgument[] queryArguments)
         {
-            // Get all the arguments from the fields
-            var fieldArguments = Helper.GetAllArgumentsFromFields(fields).ToList();
-
-            // Create list of argument variables which was not found
-            var variablesNotFoundInFields = queryArguments.ToList();
-
-            // Create mapping for each argument field
-            IDictionary<GraphQLFieldArguments, GraphQLQueryArgument> arguments = new Dictionary<GraphQLFieldArguments, GraphQLQueryArgument>();
-            ICollection<GraphQLFieldArguments> argumentsNotSet = new Collection<GraphQLFieldArguments>();
-            List<string> duplicateVariableNames = new List<string>();
-            foreach (var fieldArgument in fieldArguments)
-            {
-                // Remove from variablesNotFoundInFields
-                variablesNotFoundInFields.RemoveAll(argument => argument.VariableName == fieldArgument.VariableName);
-
-                // Find matching query arguments
-                var queryArgument = queryArguments.Where(e => e.VariableName == fieldArgument.VariableName).Take(2).ToList();
-
-                // Find match for argument
-                switch (queryArgument.Count)
-                {
-                    case 0:
-                        // Set default value
-                        if (fieldArgument.DefaultValue != null)
-                        {
-                            arguments.Add(fieldArgument, new GraphQLQueryArgument(fieldArgument.VariableName, fieldArgument.DefaultValue));
-                            break;
-                        }
-                        // If no default was set we need to check if it was required
-                        if (fieldArgument.IsRequired)
-                        {
-                            argumentsNotSet.Add(fieldArgument);
-                        }
-                        break;
-                    case 1:
-                        arguments.Add(fieldArgument, queryArgument[0]);
-                        break;
-                    default:
-                        duplicateVariableNames.Add(queryArgument[0].VariableName);
-                        break;
-                }
-            }
-
-            // If any arguments was detected not set
-            if (argumentsNotSet.Any())
-            {
-                throw new GraphQLArgumentsRequiredException(argumentsNotSet);
-            }
-
-            // If duplicate variable names has been detected
-            if (duplicateVariableNames.Any())
-            {
-                throw new GraphQLDuplicateVariablesException(duplicateVariableNames);
-            }
-
-            // Check if any supplied arguments was not found in fields
-            if (variablesNotFoundInFields.Any())
-            {
-                throw new GraphQLArgumentVariableNotFoundException(variablesNotFoundInFields);
-            }
-
-            // Get readonly arguments
-            var readonlyArguments = new ReadOnlyDictionary<GraphQLFieldArguments, GraphQLQueryArgument>(arguments);
+            // Get arguments
+            var readonlyArguments = GetArguments(fields, queryArguments);
 
             // Get query
             if (operationType == GraphQLOperationType.Subscription)
@@ -142,6 +83,112 @@ namespace SAHB.GraphQLClient.QueryGenerator
             return request;
         }
 
+        private IReadOnlyDictionary<GraphQLFieldArguments, GraphQLQueryArgument> GetArguments(ICollection<GraphQLField> fields, params GraphQLQueryArgument[] queryArguments)
+        {
+            // Get all the arguments from the fields
+            var fieldArguments = Helper.GetAllArgumentsFromFields(fields).ToList();
+
+            // Create list of argument variables which was not found
+            var variablesNotFoundInFields = queryArguments.ToList();
+
+            // Create mapping for each argument field
+            IDictionary<GraphQLFieldArguments, GraphQLQueryArgument> arguments = new Dictionary<GraphQLFieldArguments, GraphQLQueryArgument>();
+            ICollection<GraphQLFieldArguments> argumentsNotSet = new Collection<GraphQLFieldArguments>();
+            List<string> duplicateVariableNames = new List<string>();
+
+            foreach (var field in fieldArguments)
+            {
+                foreach (var fieldArgument in field.Value)
+                {
+                    // Remove from variablesNotFoundInFields
+                    variablesNotFoundInFields.RemoveAll(argument =>
+                        (argument.Field == null || argument.Field == field.Key) && // Match on field name
+                        argument.VariableName == fieldArgument.VariableName);
+
+                    // Find matching query arguments
+                    var queryArgument = queryArguments
+                        .Where(argument =>
+                            (argument.Field == null || argument.Field == field.Key) &&
+                            argument.VariableName == fieldArgument.VariableName)
+                        .Take(2)
+                        .ToList();
+
+                    // Find match for argument
+                    switch (queryArgument.Count)
+                    {
+                        case 0:
+                            // Set default value
+                            if (fieldArgument.DefaultValue != null)
+                            {
+                                arguments.Add(fieldArgument, new GraphQLQueryArgument(fieldArgument.VariableName, fieldArgument.DefaultValue));
+                                break;
+                            }
+                            // If no default was set we need to check if it was required
+                            if (fieldArgument.IsRequired)
+                            {
+                                argumentsNotSet.Add(fieldArgument);
+                            }
+                            break;
+                        case 1:
+                            arguments.Add(fieldArgument, queryArgument[0]);
+                            break;
+                        default:
+                            duplicateVariableNames.Add(queryArgument[0].VariableName);
+                            break;
+                    }
+                }
+            }
+
+            // If any arguments was detected not set
+            if (argumentsNotSet.Any())
+            {
+                throw new GraphQLArgumentsRequiredException(argumentsNotSet);
+            }
+
+            // If duplicate variable names has been detected
+            if (duplicateVariableNames.Any())
+            {
+                throw new GraphQLDuplicateVariablesException(duplicateVariableNames);
+            }
+
+            // Check if any supplied arguments was not found in fields
+            if (variablesNotFoundInFields.Any())
+            {
+                throw new GraphQLArgumentVariableNotFoundException(variablesNotFoundInFields);
+            }
+
+            // Detect any variable collision
+            var variableCollisions = arguments
+                .Where(e => !ShouldInlineArgument(e)) // If argument is inlined it will not be a problem
+                .GroupBy(e => e.Key.VariableName)
+                .Where(e => e.Count() > 1)
+                .ToList();
+
+            // Replace entire list with new arguments to prevent side effects
+            if (variableCollisions.Any())
+            {
+                arguments = arguments.ToDictionary(
+                    e => e.Key,
+                    e => (GraphQLQueryArgument)new GraphQLQueryArgumentWithOverriddenVariable(e.Value));
+            }
+
+            // Update all variables
+            foreach (var argumentVariableCollision in variableCollisions)
+            {
+                foreach (var item in argumentVariableCollision.Select((value, i) => new { i, value }))
+                {
+                    var argumentWithCollision = item.value;
+                    var index = item.i;
+
+                    argumentWithCollision.Value.VariableName += "_" + index;
+                }
+            }
+
+            // Get readonly arguments
+            var readonlyArguments = new ReadOnlyDictionary<GraphQLFieldArguments, GraphQLQueryArgument>(arguments);
+            return readonlyArguments;
+        }
+
         private bool ShouldInlineArgument(KeyValuePair<GraphQLFieldArguments, GraphQLQueryArgument> keyValuePair) =>
             ShouldInlineArgument(keyValuePair.Key, keyValuePair.Value);
 
@@ -176,14 +223,54 @@ namespace SAHB.GraphQLClient.QueryGenerator
 
         private string GenerateQueryForFields(IEnumerable<GraphQLField> fields, IReadOnlyDictionary<GraphQLFieldArguments, GraphQLQueryArgument> arguments)
         {
-            return "{" + string.Join(" ", fields.Select(field => GenerateQueryForField(field, arguments))) + "}";
+            var builder = new StringBuilder();
+            AppendSelectionSet(builder, fields, arguments);
+            return "{" + builder.ToString() + "}";
         }
 
-        private string GenerateQueryForField(GraphQLField field, IReadOnlyDictionary<GraphQLFieldArguments, GraphQLQueryArgument> arguments)
+        private void AppendSelectionSet(StringBuilder builder, IEnumerable<GraphQLField> selectionSet, IReadOnlyDictionary<GraphQLFieldArguments, GraphQLQueryArgument> arguments)
         {
-            StringBuilder builder = new StringBuilder();
+            if (selectionSet.Any())
+            {
+                bool firstField = true;
+                foreach (var field in selectionSet)
+                {
+                    if (!firstField)
+                    {
+                        builder.Append(" ");
+                    }
 
+                    // SelectionSet
+                    AppendField(builder, field, arguments);
+
+                    firstField = false;
+                }
+            }
+        }
+
+        private void AppendField(StringBuilder builder, GraphQLField field, IReadOnlyDictionary<GraphQLFieldArguments, GraphQLQueryArgument> arguments)
+        {
             // Append alias and field
+            // Format: alias:field or field
+            AppendFieldName(builder, field);
+
+            // Append arguments
+            // Format: (argumentName:$VariableName argumentName:$VariableName)
+            AppendArguments(builder, field, arguments);
+
+            // Append directives
+            // Format: @directive(argumentName:$VariableName argumentName:$VariableName)
+            AppendDirectives(builder, field, arguments);
+
+            // Append selectionSet
+            // Format: {field field}
+            AppendSelectionSet(builder, field, arguments);
+        }
+
+        private void AppendFieldName(StringBuilder builder, GraphQLField field)
+        {
+            // Append alias and field
+            // Format: alias:field or field
             if (field.Alias == null || field.Alias.Equals(field.Field, StringComparison.OrdinalIgnoreCase))
             {
                 builder.Append(field.Field);
@@ -192,7 +279,10 @@ namespace SAHB.GraphQLClient.QueryGenerator
             {
                 builder.Append(field.Alias + ":" + field.Field);
             }
+        }
 
+        private void AppendArguments(StringBuilder builder, GraphQLField field, IReadOnlyDictionary<GraphQLFieldArguments, GraphQLQueryArgument> arguments)
+        {
             // Append arguments
             // Format: (argumentName:$VariableName argumentName:$VariableName)
             var fieldArguments = field.Arguments?.ToDictionary(argument => argument,
@@ -205,20 +295,51 @@ namespace SAHB.GraphQLClient.QueryGenerator
                     fieldArguments.Select(
                         argument => argument.Key.ArgumentName + ":" +
                                     (ShouldInlineArgument(argument)
-                                        ? JsonConvert.SerializeObject(argument.Value.ArgumentValue)
+                                        ? GetArgumentValue(argument.Value.ArgumentValue)
                                         : "$" + argument.Key.VariableName))));
 
                 builder.Append(")");
             }
+        }
 
-            // Append subquery
+        private void AppendDirectives(StringBuilder builder, GraphQLField field, IReadOnlyDictionary<GraphQLFieldArguments, GraphQLQueryArgument> arguments)
+        {
+            // Append directives
+            // Format: @directive(argumentName:$VariableName argumentName:$VariableName)
+            if (field.Directives?.Any() ?? false)
+            {
+                foreach (var directive in field.Directives)
+                {
+                    builder.Append($" @{directive.DirectiveName}");
+
+                    var directiveArguments = directive.Arguments?.ToDictionary(argument => argument,
+                        argument => arguments.FirstOrDefault(e => e.Key == argument).Value).Where(e => e.Value != null);
+
+                    if (directiveArguments?.Any() ?? false)
+                    {
+                        builder.Append("(");
+                        builder.Append(string.Join(" ",
+                            directiveArguments.Select(
+                                argument => argument.Key.ArgumentName + ":" +
+                                            (ShouldInlineArgument(argument)
+                                                ? GetArgumentValue(argument.Value.ArgumentValue)
+                                                : "$" + argument.Key.VariableName))));
+                        builder.Append(")");
+                    }
+                }
+            }
+        }
+
+        private void AppendSelectionSet(StringBuilder builder, GraphQLField field, IReadOnlyDictionary<GraphQLFieldArguments, GraphQLQueryArgument> arguments)
+        {
+            // Append selectionSet
             if ((field.SelectionSet?.Any() ?? false) || (field.TargetTypes?.Any() ?? false))
             {
                 if (field.SelectionSet?.Any() ?? false)
                 {
                     builder.Append("{");
                     // SelectionSet
-                    builder.Append(string.Join(" ", field.SelectionSet.Select(e => GenerateQueryForField(e, arguments))));
+                    AppendSelectionSet(builder, field.SelectionSet, arguments);
                 }
 
                 // Get other possible subTypes
@@ -228,12 +349,8 @@ namespace SAHB.GraphQLClient.QueryGenerator
                     {
                         builder.Append($" ... on {possibleType.Key}");
                         builder.Append("{");
-                        builder.Append(string.Join(" ", possibleType.Value.SelectionSet.Select(e => GenerateQueryForField(e, arguments))));
+                        AppendSelectionSet(builder, possibleType.Value.SelectionSet, arguments);
                         builder.Append("}");
-
-                        // Append subquery
-                        //builder.Append(
-                        //    $" ... on {possibleType.Key}{GenerateQueryForFields(possibleType.Value.SelectionSet, arguments)}");
                     }
                 }
 
@@ -242,8 +359,24 @@ namespace SAHB.GraphQLClient.QueryGenerator
                     builder.Append("}");
                 }
             }
+        }
 
-            return builder.ToString();
+        private string GetArgumentValue(object argumentValue)
+        {
+            // Enums should according to GraphQL spec be serilized without quotes
+            // https://graphql.github.io/graphql-spec/June2018/#sec-Enum-Value
+            // See issue 77
+            var type = argumentValue.GetType();
+            var typeInfo = type.GetTypeInfo();
+            if (typeInfo.IsEnum)
+            {
+                // Detect EnumMember attribute
+                var enumName = Enum.GetName(type, argumentValue);
+                var enumMemberAttribute = typeInfo.GetDeclaredField(enumName).GetCustomAttribute<EnumMemberAttribute>(true);
+                return enumMemberAttribute?.Value ?? enumName;
+            }
+
+            return JsonConvert.SerializeObject(argumentValue);
         }
 
         private string GetGraphQLQuery(string queryType, string argumentVariableDeclaration, string fields)
